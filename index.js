@@ -7,184 +7,285 @@ var glob = Promise.promisify(require('glob'));
 
 module.exports = function(expectations, cli_args){
 
-    // format/normalize input
-    cli_args = format_args(cli_args);
-    expectations = format_expectations(expectations);
-
     return (
 
-        // search for files according to expectations and CLI arguments
+        // format/normalize input
         Promise.resolve(
-            search_files(expectations.files, cli_args)
+            format_cli_args(cli_args)
         )
-        // validate found files according to expectations
-        .then(function(found_files){
-            return validate(expectations.files, found_files);
+        .then(function(cli_args){
+            return {
+                cli_args: cli_args,
+                expectations: format_expectations(expectations)
+            };
         })
-        // format found files
-        .then(function(found_files){
-            return format_files(found_files, expectations.files);
+
+        // add files referenced by CLI arguments
+        .then(function(input){
+            return get_cli_file_args(input);
         })
-        // add options
-        .then(function(found_files){
-            var processed_cli_args = found_files;
-            processed_cli_args = add_options(processed_cli_args, expectations.options, cli_args);
-            return processed_cli_args;
+
+        // search for files according to expectations and CLI arguments
+        .then(function(input){
+            return search_directories(input);
+        })
+
+        // add options set by CLI arguments
+        .then(function(input){
+            return get_options(input);
+        })
+
+        // match CLI arguments with expectations
+        .then(function(input){
+            return match(input);
+        })
+
+        // validate found files and CLI arguments according to expectations
+        .then(function(input){
+            return validate(input);
+        })
+
+        // return processed CLI arguments
+        .then(function(input){
+            return format_output(input);
         })
 
     );
 
 };
 
-function format_files(found_files, expected_files){
-    expected_files
-    .forEach(function(expected_file){
-        if( ! expected_file.multiples ) {
-            found_files[expected_file.filename_extension] =
-                (found_files[expected_file.filename_extension]||[]).pop();
-        }
-    })
-    return found_files;
-}
-
-
-function format_args(cli_args){
-    var ret = cli_args || process.argv.slice(2);
-    if( ret.length === 0 ) { cli_args.push('.'); }
-    return ret;
-}
 
 function format_expectations(expectations) {
-    var options = [];
-    var files = [];
+    return (
+        ( expectations || [] )
+        .map(function(expectation_raw){
 
-    expectations
-    .forEach(function(arg){
-        var ret;
+            var expectation;
 
-        if( arg.constructor === Object ) {
-            ret = arg;
-        }
-        else {
-            ret = {};
-            if( is_option(arg) ) {
-                ret.option = arg;
+            if( expectation_raw.constructor === Object ) {
+                expectation = expectation_raw;
             }
-            else {
-                ret.filename_extension = arg;
+
+            if( expectation_raw.constructor === String ) {
+                expectation = {};
+                if( is_option(expectation_raw) ) {
+                    expectation.option = expectation_raw;
+                }
+                else {
+                    expectation.filename_extension = expectation_raw;
+                }
             }
-        }
 
-        if( ret.option ) {
-            options.push(ret);
-        }
-        if( ret.filename_extension){
-            files.push(ret);
-        }
-    });
+            if( expectation.option ) {
+                expectation.matches = expectation.matches || function( arg ) {
+                    return arg === expectation.option;
+                };
+                expectation.description = expectation.description || ('option ' + expectation.option);
+                expectation.name = expectation.name || expectation.option;
+                expectation.optional = true;
+            }
 
-    return {
-        options: options,
-        files: files
-    };
+            if( expectation.filename_extension ) {
+                expectation.matches = function( arg ) {
+                    if( arg.split('.').pop() === expectation.filename_extension ){
+                        return arg;
+                    }
+                    else {
+                        return null;
+                    }
+                };
+                expectation.description = 'file *.' + expectation.filename_extension;
+                expectation.name = expectation.name || expectation.filename_extension;
+            }
+
+            expectation.raw = expectation_raw;
+
+            if( !expectation.name ) throw "expectation needs a name";
+
+            return expectation;
+
+        })
+    );
+
 }
 
-function search_files(expected_extensions, cli_args){
-    var found_files = {};
+function format_cli_args(cli_args){
+    cli_args = cli_args || process.argv.slice(2);
+
+    if( cli_args.length === 0 ) { cli_args.push('.'); }
+
     return Promise.all(
         cli_args
-        .filter(function(arg){
-
-            return ! is_option(arg);
+        .map(function(cli_arg){
+            return {
+                raw: cli_arg,
+                path: ! is_option(cli_arg) ? path.resolve(cli_arg) : null,
+                option: is_option(cli_arg) ? cli_arg : null
+            };
         })
-        .map(function(arg){
+        .map(function(cli_arg){
+            return Promise.resolve(
+                fs
+                .statAsync(cli_arg.path)
+            )
+            .then(function(stat){
+                cli_arg.fs_stat = stat;
+                return cli_arg;
+            })
+            .catch(function(){
+                cli_arg.fs_stat = null
+                return cli_arg;
+            });
+        })
+    );
+}
 
-            var arg__path = path.resolve(arg);
+function get_cli_file_args(input){
+    input
+    .cli_args
+    .filter(function(cli_arg){
+        return cli_arg.fs_stat && cli_arg.fs_stat.isFile();
+    })
+    .forEach(function(cli_arg){
+        cli_arg.files =
+            (cli_arg.files||[]).concat(cli_arg.path);
+    });
+    return input;
+}
 
-            return fs
-                .statAsync(arg__path)
-                .catch(function(err){
-                    throw "can't find file/directory "+arg;
+function search_directories(input){
+    return Promise.all(
+        input
+        .expectations
+        .filter(function(expectation){
+            return !! expectation.filename_extension;
+        })
+        .map(function(expectation){
+            return Promise.all(
+                input
+                .cli_args
+                .filter(function(cli_arg){
+                    return cli_arg.fs_stat && cli_arg.fs_stat.isDirectory();
                 })
-                .then(function(stat){
-                    if( stat.isFile() ) {
-                        var filename_extension = arg.split('.').pop();
-                        found_files[filename_extension] = found_files[filename_extension] || [];
-                        found_files[filename_extension].push(arg__path);
-                    }
-                    return stat;
+                .map(function(cli_arg){
+                    return glob(
+                        '**/*.'+expectation.filename_extension,
+                        {
+                            cwd: cli_arg.path,
+                            realpath: true,
+                            nocase: true,
+                            nodir: true
+                        })
+                        .then(function(found){
+                            cli_arg.files =
+                                (cli_arg.files||[]).concat(found);
+                        });
                 })
-                .then(function(stat){
-                    if( expected_extensions && stat.isDirectory() ) {
-                        return Promise
-                            .all(
-                                expected_extensions
-                                .map(function(expected_ext){
-                                    var filename_extension = expected_ext.filename_extension;
-                                    return glob(
-                                        '**/*.'+filename_extension,
-                                        {
-                                            cwd: arg__path,
-                                            realpath: true,
-                                            nocase: true,
-                                            nodir: true
-                                        })
-                                        .then(function(found){
-                                            found_files[filename_extension] =
-                                                (found_files[filename_extension]||[])
-                                                .concat(found);
-                                        });
-                                }))
-                    }
-                });
+            );
         })
     )
     .then(function(){
-        return found_files;
+        return input;
     });
 }
 
-function validate(expected_extensions, found_files){
+function get_options(input){
+    input
+    .cli_args
+    .forEach(function(cli_arg){
+        cli_arg.is_option =
+            input
+            .expectations
+            .filter(function(expectation){
+                return !! expectation.option;
+            })
+            .some(function(expectation){
+                return cli_arg.option === expectation.option;
+            });
+    });
+    return input;
+}
 
-    if( !expected_extensions ) return found_files;
+function match(input) {
+    input.not_matched = [];
 
-    return Promise.resolve(function(){
+    input
+    .cli_args
+    .forEach(function(cli_arg){
+        (cli_arg.files || [cli_arg.raw])
+        .forEach(match_single);
+    });
 
-        expected_extensions
-        .forEach(function(expected_ext){
+    return input;
 
-            if( ! expected_ext.optional && !found_files[expected_ext.filename_extension]){
-                throw "couldn't find any *."+expected_ext.filename_extension+" file";
-            }
-
-            if( ! expected_ext.multiple && (found_files[expected_ext.filename_extension]||[]).length>1 ){
-                throw "found multiple *." + expected_ext.filename_extension +
-                      " files; " + found_files[expected_ext.filename_extension].join(', ');
+    function match_single(arg) {
+        var matched = false;
+        input
+        .expectations
+        .forEach(function(expectation) {
+            var val = expectation.matches(arg);
+            if( val ) {
+                matched = true;
+                expectation.matched_args =
+                    ( expectation.matched_args || [] ).concat(
+                        val );
             }
         });
-
-        for(var filename_extension in found_files){
-            if( expected_extensions
-                .every(function(expected_ext){
-                    return expected_ext.filename_extension !==  filename_extension})
-                ) {
-                throw 'found file ' + found_files[filename_extension].join(', ') +
-                      ' with unexpected filename extension ' + filename_extension;
-            }
+        if( ! matched ) {
+            input.not_matched.push( arg );
         }
-
-    })
-    .then(function(){
-        return found_files;
-    })
+    }
 }
 
-function add_options(processed_cli_args, options, cli_args){
-    options.forEach(function(option){
-        processed_cli_args[option.option] = cli_args.indexOf(option.option)!==-1;
+function validate(input){
+
+    if( !input.expectations ) return input;
+
+    var unexpectations = [];
+
+    input
+    .expectations
+    .forEach(function(expectation){
+
+        if( ! expectation.optional && ! expectation.matched_args ){
+            unexpectations.push(
+                "couldn't find any "+expectation.description );
+        }
+
+        if( ! expectation.multiple && (expectation.matched_args||[]).length>1 ){
+            unexpectations.push(
+                "found multiple " + expectation.description +
+                "; " + expectation.matched_args.join(', ') );
+        }
+
     });
 
-    return processed_cli_args;
+    input.not_matched.forEach(function(arg){
+        unexpectations.push(
+            "unexpected argument " + arg );
+    });
+
+    if( unexpectations.length >= 1 ) {
+        throw '\n'+unexpectations.join('\n');
+    }
+
+    return input;
+
+}
+
+function format_output(input){
+    var output = {};
+
+    input
+    .expectations
+    .forEach(function(expectation){
+        output[expectation.name] =
+            expectation.multiple ?
+                expectation.matched_args :
+                (expectation.matched_args||[]).pop() ;
+    });
+
+    return output;
 }
 
 function is_option(arg){
