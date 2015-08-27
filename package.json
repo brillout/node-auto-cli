@@ -1,9 +1,12 @@
 {
   "name": "auto-cli",
+  "description": "CLI arguments based on filename extension",
   "version": "0.1.1",
   "main": "index.js",
   "dependencies": {
     "bluebird": "^2.9.34",
     "glob": "^5.0.14"
-  }
+  },
+  "keywords": ["command line"],
+  "repository": "github:brillout/node-auto-cli"
 }
